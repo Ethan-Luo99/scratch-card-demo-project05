@@ -1,0 +1,48 @@
+.scratch-demo {
+  font-family: system-ui, sans-serif;
+  padding: 24px;
+  color: #222;
+}
+.scratch-demo h1 {
+  font-size: 20px;
+  margin: 0 0 16px;
+}
+.scratch-demo .cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+.scratch-demo .card-box {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 12px;
+  width: 340px;
+}
+.scratch-demo .card-box h2 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+.scratch-demo .card-mount {
+  width: 316px;
+  height: 200px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #fafafa;
+}
+.scratch-demo .ops {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.scratch-demo .ops button {
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.scratch-demo .status {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #666;
+  min-height: 32px;
+  white-space: pre-line;
+}
