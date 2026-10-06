@@ -13,6 +13,11 @@ import { SampleGrid } from './analysis/sampleCanvas.js';
 import { StrokeEstimator } from './analysis/strokeEstimator.js';
 import { ProgressAnalyzer } from './analysis/ProgressAnalyzer.js';
 import { runReveal } from './reveal/reveal.js';
+import { HistoryStack } from './history/HistoryStack.js';
+import { Recorder } from './history/Recorder.js';
+import { playEvents } from './history/playback.js';
+import { createSnapshotCanvas, applySnapshot, releaseSnapshot } from './history/snapshot.js';
+import { CoverState } from './cover/CoverLayer.js';
 
 const DEFAULTS = {
   brush: { radius: 22, shape: 'round', hardness: 1 },
@@ -23,6 +28,7 @@ const DEFAULTS = {
   touchAction: 'none',
   autoReveal: true,
   enabled: true,
+  undoLimit: 10,
 };
 
 let instanceSeq = 0;
@@ -51,6 +57,12 @@ export class ScratchCard {
     this._coverToken = 0;
     this._imageCache = null;
     this._seq = instanceSeq++;
+    // 撤销/重做与录制回放（增量能力）
+    this._history = null;
+    this._recorder = new Recorder();
+    this._currentStroke = null; // 进行中的笔划条目 { snapshot, segments, brush }
+    this._playing = false;
+    this._playHandle = null;
 
     if (this._hasSize()) {
       this._init();
@@ -168,6 +180,14 @@ export class ScratchCard {
     // DPR 运行时变化（风险 4）：matchMedia + 去抖 200ms → 重建封面并广播 reset
     this._unwatchDpr = watchPixelRatio(globalThis.window, debounce(() => this._rebuild(), 200));
 
+    // 撤销历史栈：快照 canvas 的释放统一走 onRelease
+    this._history = new HistoryStack({
+      limit: cfg.undoLimit,
+      onRelease: (entry) => {
+        if (entry && entry.snapshot) releaseSnapshot(entry.snapshot);
+      },
+    });
+
     if (cfg.enabled === false) {
       // enabled:false → 直接呈现奖品并禁用输入；不绘封面
       this._pointer.setEnabled(false);
@@ -264,29 +284,46 @@ export class ScratchCard {
   }
 
   _onPointerDown(p) {
+    if (this._playing) return; // 回放期间忽略真实输入
     if (this.state !== STATES.IDLE && this.state !== STATES.SCRATCHING) return;
     const { x, y } = this._toLogical(p.clientX, p.clientY);
-    this._tracker.down(p.pointerId, x, y);
+    this._recorder.record('down', p.pointerId, x, y);
+    this._strokeDown(p.pointerId, x, y);
+  }
+
+  // 笔划核心路径：真实输入与录制回放共用（同一 rAF 合帧、同一采样节流）
+  _strokeDown(pointerId, x, y) {
+    if (this.state !== STATES.IDLE && this.state !== STATES.SCRATCHING) return;
+    this._tracker.down(pointerId, x, y);
+    if (this._tracker.size() === 1) this._beginStrokeEntry(); // 笔划组起点
     this.state = STATES.SCRATCHING;
     // 单点也打一个洞：重复端点使 round 线帽渲染出圆点（仅 moveTo 不会绘制）
     this._pendingSegments.push([x, y, x, y]);
+    if (this._currentStroke) this._currentStroke.segments.push([x, y, x, y]);
     this._scheduleFlush();
-    this._emit(EVENTS.SCRATCH_START, { pointerId: p.pointerId, x, y });
+    this._emit(EVENTS.SCRATCH_START, { pointerId, x, y });
   }
 
   _onPointerMove(p) {
-    if (this.state !== STATES.SCRATCHING) return;
+    if (this._playing) return;
     const { x, y } = this._toLogical(p.clientX, p.clientY);
-    const segment = this._tracker.move(p.pointerId, x, y);
+    this._recorder.record('move', p.pointerId, x, y);
+    this._strokeMove(p.pointerId, x, y);
+  }
+
+  _strokeMove(pointerId, x, y) {
+    if (this.state !== STATES.SCRATCHING) return;
+    const segment = this._tracker.move(pointerId, x, y);
     if (!segment) return; // 未知 pointerId：防串轨
     this._pendingSegments.push(segment);
+    if (this._currentStroke) this._currentStroke.segments.push(segment);
     if (this._useEstimator) {
       this._estimator.stampPoints(segment, this.config.brush.radius);
     }
     this._scheduleFlush();
     this._analyzer.notifyActivity();
     this._emit(EVENTS.SCRATCH_MOVE, {
-      pointerId: p.pointerId,
+      pointerId,
       x,
       y,
       progress: this.getProgress(),
@@ -294,14 +331,53 @@ export class ScratchCard {
   }
 
   _onPointerUp(p) {
-    if (!this._tracker.has(p.pointerId)) return;
-    this._tracker.up(p.pointerId);
+    if (this._playing) return;
+    this._recorder.record('up', p.pointerId, 0, 0);
+    this._strokeUp(p.pointerId);
+  }
+
+  _strokeUp(pointerId) {
+    if (!this._tracker.has(pointerId)) return;
+    this._tracker.up(pointerId);
     this._flushSegments(); // 尾段立即落图，不等下一帧
     this._analyzer.forceSample(); // pointerup 强制补采（收口）
-    this._emit(EVENTS.SCRATCH_END, { pointerId: p.pointerId, progress: this.getProgress() });
-    if (this._tracker.size() === 0 && this.state === STATES.SCRATCHING) {
-      this.state = STATES.IDLE;
+    this._emit(EVENTS.SCRATCH_END, { pointerId, progress: this.getProgress() });
+    if (this._tracker.size() === 0) {
+      this._commitStrokeEntry();
+      if (this.state === STATES.SCRATCHING) this.state = STATES.IDLE;
     }
+  }
+
+  // ---------- 撤销/重做：笔划条目 ----------
+  // 笔划组起点（首指按下）：抓取封面位图快照；有新笔划时 redo 栈失效
+  _beginStrokeEntry() {
+    if (this._history) this._history.clearRedo();
+    this._currentStroke = null;
+    if (!this._history || this._history.limit === 0) return;
+    if (!this._cover || this._cover.state !== CoverState.PERSISTENT) return;
+    this._currentStroke = {
+      snapshot: createSnapshotCanvas(this._coverLayerRaw.getCanvas()._canvas),
+      segments: [],
+      brush: { ...this.config.brush },
+    };
+  }
+
+  _commitStrokeEntry() {
+    const entry = this._currentStroke;
+    this._currentStroke = null;
+    if (!entry || !this._history) return;
+    if (entry.segments.length === 0) {
+      releaseSnapshot(entry.snapshot);
+      return;
+    }
+    this._history.pushUndo(entry);
+  }
+
+  _discardStrokeEntry() {
+    if (this._currentStroke && this._currentStroke.snapshot) {
+      releaseSnapshot(this._currentStroke.snapshot);
+    }
+    this._currentStroke = null;
   }
 
   // ---------- 帧合并渲染（R5/R14：每帧至多一次 layer.draw()） ----------
@@ -334,6 +410,7 @@ export class ScratchCard {
     this._pointer.setEnabled(false);
     this._pendingSegments = [];
     this._tracker.clear();
+    this._discardStrokeEntry(); // reveal 打断进行中的笔划：条目不入历史
     const canvasEl = this._coverLayerRaw.getCanvas()._canvas;
     const durationMs = this.config.reveal.durationMs;
     const doc = globalThis.document;
@@ -373,12 +450,139 @@ export class ScratchCard {
     this._emit(EVENTS.REVEAL, { ratio: this.getProgress() });
   }
 
+  // ---------- 撤销/重做（G1/G2/G4） ----------
+  // 行为定义：仅在 idle 状态受理；scratching/revealing/revealed 中调用一律拒绝（返回 false），
+  // 因此撤销永远不会把卡片从 revealed 拉回，reveal 事件每生命周期仍恰好一次。
+  // 恢复为同步单帧完成（JS 单线程 + 拒绝 scratching 中调用），无异步竞争窗口。
+  get canUndo() {
+    return this._canHistoryOp() && this._history.canUndo;
+  }
+
+  get canRedo() {
+    return this._canHistoryOp() && this._history.canRedo;
+  }
+
+  _canHistoryOp() {
+    return (
+      !this._destroyed &&
+      this._initialized &&
+      !this._playing &&
+      this.state === STATES.IDLE &&
+      !!this._history
+    );
+  }
+
+  // 撤销最近一笔：恢复该笔划前的封面快照，段列移交 redo 栈（重放用，不再持快照）
+  undo() {
+    if (!this._canHistoryOp()) return false;
+    const entry = this._history.popUndo();
+    if (!entry) return false;
+    const canvasEl = this._coverLayerRaw.getCanvas()._canvas;
+    applySnapshot(canvasEl, entry.snapshot, this.config.width, this.config.height);
+    releaseSnapshot(entry.snapshot);
+    entry.snapshot = null;
+    this._history.pushRedo({ segments: entry.segments, brush: entry.brush });
+    this._rebuildEstimatorFromHistory();
+    this._resampleAfterHistoryChange();
+    return true;
+  }
+
+  // 重做：重放该笔划段列（与真实笔迹同一渲染路径），并补抓快照供再次 undo
+  redo() {
+    if (!this._canHistoryOp()) return false;
+    const entry = this._history.popRedo();
+    if (!entry) return false;
+    const snapshot = createSnapshotCanvas(this._coverLayerRaw.getCanvas()._canvas);
+    this._cover.scratchSegments(entry.segments, entry.brush);
+    if (this._useEstimator) {
+      for (const seg of entry.segments) this._estimator.stampPoints(seg, entry.brush.radius);
+    }
+    this._history.pushUndo({ snapshot, segments: entry.segments, brush: entry.brush });
+    this._resampleAfterHistoryChange();
+    return true;
+  }
+
+  // taint 降级模式下估算器无法从位图反推：按剩余 undo 历史重盖章
+  _rebuildEstimatorFromHistory() {
+    if (!this._useEstimator) return;
+    this._estimator.reset();
+    this._history.forEachUndo((entry) => {
+      for (const seg of entry.segments) this._estimator.stampPoints(seg, entry.brush.radius);
+    });
+  }
+
+  // 历史变更后重采：progress 回退/前进并正常派发；若仍达标则按既有规则自动 reveal
+  _resampleAfterHistoryChange() {
+    this._analyzer.reset();
+    this._analyzer.forceSample();
+  }
+
+  _clearHistory() {
+    this._discardStrokeEntry();
+    if (this._history) this._history.clear();
+  }
+
+  // ---------- 录制回放（G3/G4） ----------
+  get isPlaying() {
+    return this._playing;
+  }
+
+  // 导出可 JSON 序列化的笔迹包（pointerId、逻辑坐标、相对首事件的时间戳）
+  exportRecording() {
+    return this._recorder.export({ width: this.config.width, height: this.config.height });
+  }
+
+  // 按时间戳节拍重放笔迹；隐式 reset 到全新封面后回放。
+  // 回放复用 _stroke* 真实输入路径（同一 rAF 合帧、同一采样节流），期间真实输入被忽略。
+  playRecording({ speed = 1, recording } = {}) {
+    if (this._destroyed || !this._initialized || this._playing) return false;
+    if (this.state !== STATES.IDLE) return false;
+    const rec = recording || this.exportRecording();
+    if (!rec || !Array.isArray(rec.events) || rec.events.length === 0) return false;
+    const events = rec.events;
+    this.reset(); // 先清场（也会取消可能残留的回放/历史/录制）
+    this._playing = true;
+    this._emit(EVENTS.PLAY_START, { speed });
+    this._playHandle = playEvents(events, {
+      speed,
+      emit: (ev) => this._applyRecordedEvent(ev),
+      onDone: () => {
+        this._playHandle = null;
+        this._playing = false;
+        this._emit(EVENTS.PLAY_END, { interrupted: false });
+      },
+    });
+    return true;
+  }
+
+  _applyRecordedEvent(ev) {
+    if (this._destroyed) return;
+    if (ev.type === 'down') this._strokeDown(ev.pointerId, ev.x, ev.y);
+    else if (ev.type === 'move') this._strokeMove(ev.pointerId, ev.x, ev.y);
+    else if (ev.type === 'up') this._strokeUp(ev.pointerId);
+  }
+
+  _cancelPlayback() {
+    if (this._playHandle) {
+      this._playHandle.cancel();
+      this._playHandle = null;
+    }
+    if (this._playing) {
+      this._playing = false;
+      this._emit(EVENTS.PLAY_END, { interrupted: true });
+    }
+  }
+
   // ---------- DPR 重建（风险 4） ----------
   _rebuild() {
     if (this._destroyed || !this._initialized) return;
     const next = resolvePixelRatio(this.config.pixelRatioCap);
     if (next === this._pixelRatio) return;
     this._pixelRatio = next;
+    // 位图按旧 DPR 抓取的快照全部失效：清空历史与录制
+    this._cancelPlayback();
+    this._clearHistory();
+    this._recorder.clear();
     // setPixelRatio → setSize 重分配位图并重置 context（Canvas.js:113-119），封面被清空
     this._prizeLayer.getCanvas().setPixelRatio(next);
     this._coverLayerRaw.getCanvas().setPixelRatio(next);
@@ -409,6 +613,9 @@ export class ScratchCard {
   reset(newCover) {
     if (this._destroyed) return;
     if (newCover) this.config.cover = newCover;
+    this._cancelPlayback();
+    this._clearHistory();
+    this._recorder.clear();
     if (this._revealHandle) {
       this._revealHandle.cancel();
       this._revealHandle = null;
@@ -449,6 +656,9 @@ export class ScratchCard {
     this._destroyed = true;
     this.state = STATES.DESTROYED;
     this._coverToken++; // 使进行中的图片加载回调失效
+    this._cancelPlayback();
+    this._clearHistory();
+    this._recorder.clear();
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;

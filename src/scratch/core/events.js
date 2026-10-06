@@ -8,6 +8,8 @@ export const EVENTS = Object.freeze({
   REVEAL: 'reveal',
   RESET: 'reset',
   DESTROYED: 'destroyed',
+  PLAY_START: 'playstart',
+  PLAY_END: 'playend',
 });
 
 export const STATES = Object.freeze({

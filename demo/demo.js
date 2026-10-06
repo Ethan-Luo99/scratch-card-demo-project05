@@ -96,9 +96,11 @@ function mountCard(box, def) {
   mount.className = 'card-mount';
   const ops = document.createElement('div');
   ops.className = 'ops';
+  const ops2 = document.createElement('div');
+  ops2.className = 'ops';
   const status = document.createElement('div');
   status.className = 'status';
-  box.append(mount, ops, status);
+  box.append(mount, ops, ops2, status);
 
   const card = new ScratchCard(mount, {
     width: W,
@@ -107,14 +109,27 @@ function mountCard(box, def) {
     prize: { factory: makePrize(def.prizeText) },
     brush: { radius: 18, shape: 'round', hardness: 1 },
     targetRatio: 0.5,
+    undoLimit: 10,
   });
 
   const say = (msg) => { status.textContent = msg; };
-  card.on('progress', ({ ratio }) => say(`progress: ${(ratio * 100).toFixed(1)}%  state: ${card.state}`));
-  card.on('reveal', ({ ratio }) => say(`🎉 reveal! ratio=${(ratio * 100).toFixed(1)}%`));
-  card.on('reset', () => say('已重置'));
+  const refresh = () => {
+    undoBtn.disabled = !card.canUndo;
+    redoBtn.disabled = !card.canRedo;
+    playBtn.disabled = card.state === 'destroyed' || card.isPlaying;
+  };
+  card.on('progress', ({ ratio }) => {
+    say(`progress: ${(ratio * 100).toFixed(1)}%  state: ${card.state}`);
+    refresh();
+  });
+  card.on('reveal', ({ ratio }) => { say(`🎉 reveal! ratio=${(ratio * 100).toFixed(1)}%`); refresh(); });
+  card.on('reset', () => { say('已重置'); refresh(); });
   card.on('destroyed', () => say('已销毁'));
   card.on('progress-error', () => say('采样失败，已降级为笔画估算'));
+  card.on('scratchstart', refresh);
+  card.on('scratchend', refresh);
+  card.on('playstart', () => { say('回放中…'); refresh(); });
+  card.on('playend', ({ interrupted }) => { say(interrupted ? '回放被中断' : '回放结束'); refresh(); });
 
   for (const [label, fn] of [
     ['reset', () => card.reset()],
@@ -124,9 +139,45 @@ function mountCard(box, def) {
   ]) {
     const b = document.createElement('button');
     b.textContent = label;
-    b.onclick = fn;
+    b.onclick = () => { fn(); refresh(); };
     ops.append(b);
   }
+
+  // ---- 撤销/重做 + 录制回放操作区 ----
+  const undoBtn = document.createElement('button');
+  undoBtn.textContent = 'undo';
+  undoBtn.onclick = () => { card.undo(); refresh(); };
+  const redoBtn = document.createElement('button');
+  redoBtn.textContent = 'redo';
+  redoBtn.onclick = () => { card.redo(); refresh(); };
+
+  let savedRecording = null;
+  const recBtn = document.createElement('button');
+  recBtn.textContent = '导出录制';
+  recBtn.onclick = () => {
+    savedRecording = card.exportRecording();
+    console.log('[recording]', JSON.stringify(savedRecording));
+    say(`已导出录制：${savedRecording.events.length} 个事件（见 console）`);
+    refresh();
+  };
+
+  const speedSel = document.createElement('select');
+  for (const s of [1, 2, 4]) {
+    const opt = document.createElement('option');
+    opt.value = String(s);
+    opt.textContent = `${s}x`;
+    speedSel.append(opt);
+  }
+  const playBtn = document.createElement('button');
+  playBtn.textContent = '回放';
+  playBtn.onclick = () => {
+    const speed = Number(speedSel.value) || 1;
+    const ok = card.playRecording(savedRecording ? { speed, recording: savedRecording } : { speed });
+    if (!ok) say('无法回放：无录制数据或当前状态不允许');
+    refresh();
+  };
+  ops2.append(undoBtn, redoBtn, recBtn, speedSel, playBtn);
+  refresh();
   return card;
 }
 

@@ -39,6 +39,13 @@
   font-size: 12px;
   cursor: pointer;
 }
+.scratch-demo .ops button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.scratch-demo .ops select {
+  font-size: 12px;
+}
 .scratch-demo .status {
   margin-top: 8px;
   font-size: 12px;
