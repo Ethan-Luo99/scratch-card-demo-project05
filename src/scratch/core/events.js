@@ -8,6 +8,9 @@ export const EVENTS = Object.freeze({
   REVEAL: 'reveal',
   RESET: 'reset',
   DESTROYED: 'destroyed',
+  // G3 增量：录制回放生命周期（主状态机不变，仅附加标志）
+  PLAY_START: 'playstart',
+  PLAY_END: 'playend',
 });
 
 export const STATES = Object.freeze({

@@ -78,6 +78,25 @@ export class ProgressAnalyzer {
     return this._failed;
   }
 
+  // undo/redo 后位图已整体变化：以当前采样值重置口径，不重新触发 onReach。
+  // 采样失败时返回 false（调用方负责 taint 降级）。
+  resync(t = this.now()) {
+    if (this._destroyed) return false;
+    let ratio;
+    try {
+      ratio = this.sampleFn();
+    } catch (err) {
+      return false;
+    }
+    this.ratio = ratio;
+    this._lastSampleAt = t;
+    this._confirmCount = 0;
+    // autoReveal 场景撤销后必然在阈值以下；autoReveal:false 仅同步 reached 标志
+    this._reached = ratio >= this.targetRatio;
+    if (this.onProgress) this.onProgress({ ratio, sampledAt: t });
+    return true;
+  }
+
   // 换采样函数（taint 降级为笔画估算时由 ScratchCard 调用）
   setSampleFn(fn) {
     this.sampleFn = fn;

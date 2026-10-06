@@ -115,18 +115,73 @@ function mountCard(box, def) {
   card.on('reset', () => say('已重置'));
   card.on('destroyed', () => say('已销毁'));
   card.on('progress-error', () => say('采样失败，已降级为笔画估算'));
+  card.on('playstart', () => { say('▶ 回放中…（真实输入已锁定）'); refresh(); });
+  card.on('playend', () => { say('■ 回放结束'); refresh(); });
 
-  for (const [label, fn] of [
-    ['reset', () => card.reset()],
-    ['reveal', () => card.reveal()],
-    ['reveal(instant)', () => card.reveal(true)],
-    ['destroy', () => card.destroy()],
-  ]) {
+  const addOpsRow = () => {
+    const row = document.createElement('div');
+    row.className = 'ops';
+    ops.append(row);
+    return row;
+  };
+  const btn = (row, label, fn) => {
     const b = document.createElement('button');
     b.textContent = label;
     b.onclick = fn;
-    ops.append(b);
+    row.append(b);
+    return b;
+  };
+
+  // 第一行：既有 reveal/reset/destroy
+  const row1 = addOpsRow();
+  btn(row1, 'reset', () => card.reset());
+  btn(row1, 'reveal', () => card.reveal());
+  btn(row1, 'reveal(instant)', () => card.reveal(true));
+  btn(row1, 'destroy', () => card.destroy());
+
+  // 第二行：撤销 / 重做（空历史时禁用）
+  const row2 = addOpsRow();
+  const undoBtn = btn(row2, '↶ undo', () => { card.undo(); refresh(); });
+  const redoBtn = btn(row2, '↷ redo', () => { card.redo(); refresh(); });
+
+  // 第三行：录制 / 回放 + 速度切换
+  const row3 = addOpsRow();
+  const recBtn = btn(row3, '● 开始录制', () => {
+    if (card.recording) {
+      card.stopRecording();
+      say('录制已停止并保存');
+    } else {
+      card.startRecording();
+      say('● 录制中…再次点击停止');
+    }
+    refresh();
+  });
+  const speedSel = document.createElement('select');
+  for (const v of ['0.5', '1', '2', '4']) {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = `${v}×`;
+    if (v === '1') opt.selected = true;
+    speedSel.append(opt);
   }
+  const playBtn = btn(row3, '▶ 回放', () => {
+    card.playRecording({ speed: Number(speedSel.value) });
+  });
+  row3.append(speedSel);
+
+  const refresh = () => {
+    const dead = card.state === 'destroyed';
+    undoBtn.disabled = dead || !card.canUndo;
+    redoBtn.disabled = dead || !card.canRedo;
+    recBtn.textContent = card.recording ? '■ 停止录制' : '● 开始录制';
+    playBtn.disabled = dead || card.playing || card.recording;
+    recBtn.disabled = dead || card.playing;
+    speedSel.disabled = dead || card.playing;
+  };
+  card.on('scratchend', refresh);
+  card.on('reset', refresh);
+  card.on('destroyed', refresh);
+  refresh();
   return card;
 }
 
