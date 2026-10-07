@@ -154,6 +154,30 @@ export class CoverLayer {
     crop.canvas = null;
   }
 
+  // H2：整幅位图恢复（importState 封面 dataURL 回绘）。
+  // 与 pasteCrops 同一模式：Konva.Image add → 单次 draw → remove 回池，source-over。
+  paintImage(image) {
+    if (this.state !== CoverState.PERSISTENT || !this._createImage || !image) return;
+    const layer = this.layer;
+    const ratio = this._getPixelRatio() || 1;
+    const canvas = layer.getCanvas();
+    const node = this._imagePool.pop() || this._createImage();
+    node.setAttrs({
+      image,
+      x: 0,
+      y: 0,
+      width: canvas.width / ratio,
+      height: canvas.height / ratio,
+      listening: false,
+      opacity: 1,
+      globalCompositeOperation: 'source-over',
+    });
+    layer.add(node);
+    layer.draw(); // 不清屏：整幅覆盖持久位图
+    node.remove();
+    this._releaseImages([node]);
+  }
+
   // reveal 完成后清空位图（清屏一次再切回持久态，保持状态机一致）
   clearBitmap() {
     if (this.state !== CoverState.PERSISTENT) return;

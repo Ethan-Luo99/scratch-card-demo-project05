@@ -54,3 +54,30 @@
   min-height: 32px;
   white-space: pre-line;
 }
+.scratch-demo .import-input {
+  font-size: 12px;
+  max-width: 180px;
+}
+.scratch-demo .clip-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.scratch-demo .clip-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.scratch-demo .clip-item .clip-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scratch-demo .clip-item button {
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}

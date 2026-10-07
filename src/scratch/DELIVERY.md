@@ -56,3 +56,22 @@ demo 主页 headless 验证：3 个 konvajs-content、6 个 layer canvas 正常�
 - 多卡错峰用实例序号 ×7ms 偏移首采时刻（R6），非严格随机。
 - 测试命令：`node --test "src/scratch/__tests__/**/*.test.js"`
   （Node 24 下 `node --test <目录>` 会被当作入口模块解析，需用 glob）。
+
+## H1–H5 增量交付（片段库 + 状态序列化恢复）
+
+- **H1 片段生命周期**：`startClip(label)`/`stopClip()` 复用 G3 Recorder，产出
+  `Clip{id,label,duration,events}` 入 `record/ClipLibrary.js`；`listClips/removeClip/clearClips`
+  为库直委托；`playRecording` 形参扩展为 录制对象 | clip | clip id | id 数组，
+  数组经 `concatClipEvents` 按 duration 累计偏移顺序拼接（节拍连续），任一 id 未找到整体拒绝。
+- **状态机交互**：录制中 reset → 标记入列、片段继续（既有语义）；reveal → 自动 stopClip
+  落库（输入即将锁定）；destroy → 进行中片段丢弃不入库；stopRecording 在片段录制中等价 stopClip。
+- **H2 版本策略**：`state/serialize.js` STATE_VERSION=1，未知主版本拒绝、未知字段忽略
+  （白名单提取 + 事件逐条校验）；导出含 clips/undoLimit/进度口径(ratio+targetRatio+sampling)/
+  封面 dataURL（taint 时置 null）。
+- **H3 容量与降级**：单 key 整体落盘，超 storageQuota 按 lastUsedAt LRU 淘汰（播放即 touch）；
+  单条超限留内存不落盘；localStorage 探测/读/写抛错 → 永久内存态 + 一次性 storage-error 事件。
+- **H4 importState 接受矩阵**：idle/scratching/revealing/revealed 接受（内部走 reset 同路径，
+  再恢复 undoLimit/片段库/封面位图并 resync 进度）；playing/recording/destroyed/未初始化 →
+  拒绝返回 false（不中断现状）。导入后 undo/redo/录制/回放与直接操作一致（历史清空同 reset 契约）。
+- **H5 demo**：每卡新增片段录制行、片段列表（▶/✕）、播放全部、导出 JSON（a[download]）、
+  导入（input[type=file]）；每卡独立 storageKeyPrefix。

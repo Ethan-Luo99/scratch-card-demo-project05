@@ -75,16 +75,19 @@ function makeNodesCover() {
 
 const CARDS = [
   {
+    key: 'color',
     title: '封面类型：color（纯色）',
     cover: { type: 'color', value: '#b8860b' },
     prizeText: '¥5 优惠券',
   },
   {
+    key: 'image',
     title: '封面类型：image（图片）',
     cover: { type: 'image', src: COVER_SVG },
     prizeText: '免单券 ×1',
   },
   {
+    key: 'nodes',
     title: '封面类型：nodes（自定义 Konva 节点）',
     cover: { type: 'nodes', factory: makeNodesCover() },
     prizeText: '积分 +200',
@@ -107,6 +110,7 @@ function mountCard(box, def) {
     prize: { factory: makePrize(def.prizeText) },
     brush: { radius: 18, shape: 'round', hardness: 1 },
     targetRatio: 0.5,
+    storageKeyPrefix: `scratch-demo-${def.key}`, // H3：每卡独立片段库命名空间
   });
 
   const say = (msg) => { status.textContent = msg; };
@@ -117,6 +121,7 @@ function mountCard(box, def) {
   card.on('progress-error', () => say('采样失败，已降级为笔画估算'));
   card.on('playstart', () => { say('▶ 回放中…（真实输入已锁定）'); refresh(); });
   card.on('playend', () => { say('■ 回放结束'); refresh(); });
+  card.on('storage-error', () => say('⚠ localStorage 不可用，片段仅保存在内存（storage-error）'));
 
   const addOpsRow = () => {
     const row = document.createElement('div');
@@ -169,6 +174,85 @@ function mountCard(box, def) {
   });
   row3.append(speedSel);
 
+  // 第四行：片段录制（H1）+ 播放全部（id 数组顺序拼接）
+  const row4 = addOpsRow();
+  const clipBtn = btn(row4, '● 开始片段', () => {
+    if (card.clipActive) {
+      const clip = card.stopClip();
+      say(clip ? `片段已入库：${clip.label || clip.id}` : '无进行中片段');
+    } else {
+      const label = prompt('片段标签（可空）', '') ?? '';
+      if (card.startClip(label)) say('● 片段录制中…再次点击停止入库');
+    }
+    renderClips();
+    refresh();
+  });
+  const playAllBtn = btn(row4, '▶ 播放全部片段', () => {
+    const ids = card.listClips().map((c) => c.id);
+    if (ids.length > 0) card.playRecording({ recording: ids, speed: Number(speedSel.value) });
+  });
+
+  // 第五行：状态导出（a[download]）/ 导入（input[type=file]）（H2/H5）
+  const row5 = addOpsRow();
+  btn(row5, '⬇ 导出 JSON', () => {
+    const state = card.exportState();
+    if (!state) return;
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `scratch-state-${def.key}-${Date.now()}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 0);
+    say('已导出状态 JSON（含片段库与封面位图）');
+  });
+  const importInput = document.createElement('input');
+  importInput.type = 'file';
+  importInput.accept = 'application/json,.json';
+  importInput.className = 'import-input';
+  importInput.title = '导入状态 JSON';
+  importInput.onchange = async () => {
+    const file = importInput.files && importInput.files[0];
+    if (!file) return;
+    const ok = card.importState(await file.text());
+    say(ok ? '✅ 状态已导入（片段库已替换，封面/进度恢复中）' : '❌ 导入被拒绝（版本不符 / 播放或录制中）');
+    importInput.value = '';
+    renderClips();
+    refresh();
+  };
+  row5.append(importInput);
+
+  // 片段列表：播放 / 删除（H5）
+  const clipList = document.createElement('div');
+  clipList.className = 'clip-list';
+  ops.append(clipList);
+
+  function renderClips() {
+    clipList.innerHTML = '';
+    const clips = card.listClips();
+    for (const clip of clips) {
+      const item = document.createElement('div');
+      item.className = 'clip-item';
+      const name = document.createElement('span');
+      name.className = 'clip-name';
+      name.textContent = `${clip.label || clip.id}（${(clip.duration / 1000).toFixed(1)}s）`;
+      const play = document.createElement('button');
+      play.textContent = '▶';
+      play.title = '播放该片段';
+      play.onclick = () => card.playRecording({ recording: clip.id, speed: Number(speedSel.value) });
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = '删除该片段';
+      del.onclick = () => {
+        card.removeClip(clip.id);
+        renderClips();
+      };
+      item.append(name, play, del);
+      clipList.append(item);
+    }
+    playAllBtn.disabled = clips.length === 0 || card.playing;
+  }
+  renderClips();
+
   const refresh = () => {
     const dead = card.state === 'destroyed';
     undoBtn.disabled = dead || !card.canUndo;
@@ -177,6 +261,9 @@ function mountCard(box, def) {
     playBtn.disabled = dead || card.playing || card.recording;
     recBtn.disabled = dead || card.playing;
     speedSel.disabled = dead || card.playing;
+    clipBtn.textContent = card.clipActive ? '■ 停止片段' : '● 开始片段';
+    clipBtn.disabled = dead || card.playing || (card.recording && !card.clipActive);
+    playAllBtn.disabled = dead || card.playing || card.listClips().length === 0;
   };
   card.on('scratchend', refresh);
   card.on('reset', refresh);
