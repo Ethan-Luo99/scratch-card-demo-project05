@@ -56,3 +56,22 @@ demo 主页 headless 验证：3 个 konvajs-content、6 个 layer canvas 正常�
 - 多卡错峰用实例序号 ×7ms 偏移首采时刻（R6），非严格随机。
 - 测试命令：`node --test "src/scratch/__tests__/**/*.test.js"`
   （Node 24 下 `node --test <目录>` 会被当作入口模块解析，需用 glob）。
+
+## H1–H5 增量（片段库 + 状态序列化恢复）
+
+- **H1 片段库**：`startClip(label)`/`stopClip()` 产出 `Clip{id,label,duration,events}` 入
+  `record/ClipStore.js`；`listClips/removeClip/clearClips`；`playRecording` 的 `recording`
+  形参扩展为：既有 {version,events}、单个 clip、单个 clip id、clip id 数组（按 duration
+  顺移拼接、节拍连续，任一 id 缺失整体拒绝）。录制中 reset → reset 标记入片段事件
+  （沿用 G3 语义）；reveal → 片段截断入库；destroy → 进行中的片段丢弃、已入库片段保留。
+- **H2 序列化**：`exportState()` 返回 JSON 字符串（version/undoLimit/进度口径/clips/封面
+  位图 dataURL 内嵌，taint 时 cover 为 null）；`importState(json)` 接受字符串或对象，
+  未知主版本拒绝（false）、未知字段忽略；导入后回 idle、清 undo/redo 栈、按恢复位图
+  重采样（taint 时采用导出口径并派发 progress-error）。
+- **H3 持久化**：clips 每次变更即写 localStorage（`storagePrefix` 可配，index + 每片段
+  一键）；总字节超 `storageQuota` 按 lastUsed LRU 淘汰（最新片段不淘汰自己，单片段超
+  配额仅留内存）；localStorage 不可用降级纯内存并派发一次 `storage-error`。
+- **H4 交互**：playing/recording/scratching/destroyed 中 `importState` 一律拒绝；
+  idle/revealing/revealed 接受；导入后 undo/redo/录制/回放语义与直接操作一致。
+- **H5 demo**：每卡新增片段录制行、片段列表（▶ 播放 / ✕ 删除 / 全部顺序播放）、
+  导出 JSON（a[download]）、导入（input[type=file]）。

@@ -96,9 +96,11 @@ function mountCard(box, def) {
   mount.className = 'card-mount';
   const ops = document.createElement('div');
   ops.className = 'ops';
+  const clipsBox = document.createElement('ul');
+  clipsBox.className = 'clips';
   const status = document.createElement('div');
   status.className = 'status';
-  box.append(mount, ops, status);
+  box.append(mount, ops, clipsBox, status);
 
   const card = new ScratchCard(mount, {
     width: W,
@@ -117,6 +119,8 @@ function mountCard(box, def) {
   card.on('progress-error', () => say('采样失败，已降级为笔画估算'));
   card.on('playstart', () => { say('▶ 回放中…（真实输入已锁定）'); refresh(); });
   card.on('playend', () => { say('■ 回放结束'); refresh(); });
+  card.on('clipschange', () => refreshClips());
+  card.on('storage-error', () => say('⚠ localStorage 不可用，片段仅保存在内存（storage-error）'));
 
   const addOpsRow = () => {
     const row = document.createElement('div');
@@ -169,12 +173,89 @@ function mountCard(box, def) {
   });
   row3.append(speedSel);
 
+  // 第四行：H1 片段录制 + 全部片段顺序播放
+  const row4 = addOpsRow();
+  const clipLabel = document.createElement('input');
+  clipLabel.placeholder = '片段名';
+  clipLabel.size = 8;
+  const clipBtn = btn(row4, '● 开始片段', () => {
+    if (card.recording) {
+      const clip = card.stopClip();
+      if (!clip) card.stopRecording();
+      say(clip ? `片段已保存：${clip.label || clip.id}（${(clip.duration / 1000).toFixed(1)}s）` : '录制已停止');
+    } else {
+      card.startClip(clipLabel.value.trim());
+      say('● 片段录制中…再次点击停止');
+    }
+    refresh();
+  });
+  row4.append(clipLabel);
+  const playAllBtn = btn(row4, '▶ 全部片段', () => {
+    const ids = card.listClips().map((c) => c.id);
+    card.playRecording({ speed: Number(speedSel.value), recording: ids });
+  });
+
+  // 第五行：H2 导出 / 导入
+  const row5 = addOpsRow();
+  btn(row5, '⬇ 导出 JSON', () => {
+    const json = card.exportState();
+    if (!json) return;
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `scratch-state-${Date.now()}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    say('已导出状态 JSON');
+  });
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = 'application/json,.json';
+  fileInput.style.display = 'none';
+  btn(row5, '⬆ 导入 JSON', () => fileInput.click());
+  fileInput.onchange = () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileInput.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const ok = card.importState(String(reader.result));
+      say(ok ? '导入成功：封面/片段/进度已恢复' : '导入被拒绝（版本不符或当前状态不可导入）');
+      refresh();
+    };
+    reader.readAsText(file);
+  };
+  row5.append(fileInput);
+
+  // H1：片段列表（播放 / 删除）
+  const refreshClips = () => {
+    clipsBox.innerHTML = '';
+    for (const clip of card.listClips()) {
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.textContent = `${clip.label || clip.id} · ${(clip.duration / 1000).toFixed(1)}s · ${clip.events.length} 事件`;
+      const play = document.createElement('button');
+      play.textContent = '▶';
+      play.title = '播放该片段';
+      play.onclick = () => card.playRecording({ speed: Number(speedSel.value), recording: clip.id });
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = '删除该片段';
+      del.onclick = () => { card.removeClip(clip.id); };
+      li.append(name, play, del);
+      clipsBox.append(li);
+    }
+  };
+
   const refresh = () => {
     const dead = card.state === 'destroyed';
     undoBtn.disabled = dead || !card.canUndo;
     redoBtn.disabled = dead || !card.canRedo;
     recBtn.textContent = card.recording ? '■ 停止录制' : '● 开始录制';
+    clipBtn.textContent = card.recording ? '■ 停止片段' : '● 开始片段';
     playBtn.disabled = dead || card.playing || card.recording;
+    clipBtn.disabled = dead || card.playing;
+    playAllBtn.disabled = dead || card.playing || card.recording;
     recBtn.disabled = dead || card.playing;
     speedSel.disabled = dead || card.playing;
   };
@@ -182,6 +263,7 @@ function mountCard(box, def) {
   card.on('reset', refresh);
   card.on('destroyed', refresh);
   refresh();
+  refreshClips();
   return card;
 }
 

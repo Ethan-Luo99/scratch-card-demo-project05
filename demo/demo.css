@@ -43,9 +43,38 @@
   font-size: 12px;
   padding: 3px 4px;
 }
+.scratch-demo .ops input {
+  font-size: 12px;
+  padding: 3px 6px;
+  width: 90px;
+}
 .scratch-demo .ops button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+.scratch-demo .clips {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  font-size: 12px;
+  color: #444;
+}
+.scratch-demo .clips li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.scratch-demo .clips li span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scratch-demo .clips li button {
+  padding: 1px 7px;
+  font-size: 11px;
+  cursor: pointer;
 }
 .scratch-demo .status {
   margin-top: 8px;

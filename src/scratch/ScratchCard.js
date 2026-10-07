@@ -14,8 +14,13 @@ import { StrokeEstimator } from './analysis/strokeEstimator.js';
 import { ProgressAnalyzer } from './analysis/ProgressAnalyzer.js';
 import { runReveal } from './reveal/reveal.js';
 import { StrokeHistory } from './history/StrokeHistory.js';
-import { Recorder, defaultNow } from './record/Recorder.js';
+import { Recorder, RECORDING_VERSION, defaultNow } from './record/Recorder.js';
 import { Player } from './record/Player.js';
+import { ClipStore } from './record/ClipStore.js';
+import { CoverState } from './cover/CoverLayer.js';
+
+// H2：exportState/importState 快照格式主版本号（未知主版本拒绝导入）
+export const STATE_VERSION = 1;
 
 const DEFAULTS = {
   brush: { radius: 22, shape: 'round', hardness: 1 },
@@ -27,6 +32,8 @@ const DEFAULTS = {
   autoReveal: true,
   enabled: true,
   undoLimit: 20, // G2：撤销历史笔划数上限，超限淘汰最旧；0 关闭撤销能力
+  storagePrefix: 'scratch-card:clips:', // H3：片段持久化 localStorage key 前缀
+  storageQuota: 2 * 1024 * 1024, // H3：片段持久化总字节上限，超限 LRU 淘汰
 };
 
 let instanceSeq = 0;
@@ -59,6 +66,15 @@ export class ScratchCard {
     this._recorder = new Recorder({ now: defaultNow }); // G3
     this._lastRecording = null; // 最近一次 stop 的录制结果（playRecording 默认重放它）
     this._player = null; // _init 时装配（依赖逻辑输入路径）
+    // H1/H3：片段库（内存权威 + localStorage 持久镜像，降级时一次性上报）
+    this._clipLabel = null; // 录制中的片段标签；null 表示非片段录制
+    this._clipSeq = 0;
+    this._importToken = 0; // H2：使过期的导入位图加载回调失效
+    this._clipStore = new ClipStore({
+      prefix: this.config.storagePrefix,
+      quota: this.config.storageQuota,
+      onStorageError: (error) => this._emit(EVENTS.STORAGE_ERROR, { error }),
+    });
 
     if (this._hasSize()) {
       this._init();
@@ -388,6 +404,8 @@ export class ScratchCard {
       this._pendingReveal = instant ? 'instant' : 'deferred';
       return;
     }
+    // H1：reveal 截断进行中的录制（片段录制在此刻入库保存）
+    this._stopActiveRecording();
     this.state = STATES.REVEALING;
     this._pointer.setEnabled(false);
     this._pendingSegments = [];
@@ -589,9 +607,72 @@ export class ScratchCard {
 
   stopRecording() {
     if (!this._recorder.recording) return false;
+    if (this._clipLabel !== null) {
+      this._finalizeClip(); // 片段录制经 stopRecording 停止：同样入库
+      return true;
+    }
     this._recorder.stop();
     this._lastRecording = this._recorder.exportRecording();
     return true;
+  }
+
+  // 录制截断（reveal 调用）：片段录制入库，普通录制存入 _lastRecording
+  _stopActiveRecording() {
+    if (!this._recorder.recording) return;
+    if (this._clipLabel !== null) {
+      this._finalizeClip();
+    } else {
+      this._recorder.stop();
+      this._lastRecording = this._recorder.exportRecording();
+    }
+  }
+
+  // ---------- H1：片段库 ----------
+  // startClip 与 startRecording 共用同一 Recorder；已在录制/回放中则拒绝。
+  // 录制中 reset → reset 标记入片段事件；reveal → 片段截断入库；destroy → 进行中的片段丢弃。
+  startClip(label = '') {
+    if (this._destroyed || this._recorder.recording) return false;
+    if (this._player && this._player.playing) return false;
+    this._clipLabel = String(label || '');
+    this._recorder.start();
+    return true;
+  }
+
+  // 停止片段录制并入库；当前不是片段录制时返回 null
+  stopClip() {
+    if (!this._recorder.recording || this._clipLabel === null) return null;
+    return this._finalizeClip();
+  }
+
+  _finalizeClip() {
+    const label = this._clipLabel;
+    this._clipLabel = null;
+    this._recorder.stop();
+    const { events } = this._recorder.exportRecording();
+    const clip = {
+      id: `clip-${Date.now().toString(36)}-${++this._clipSeq}`,
+      label,
+      duration: Math.round(this._recorder.duration),
+      events,
+    };
+    this._clipStore.add(clip);
+    this._emit(EVENTS.CLIPS_CHANGE, { action: 'add', id: clip.id });
+    return clip;
+  }
+
+  listClips() {
+    return this._clipStore.list();
+  }
+
+  removeClip(id) {
+    const ok = this._clipStore.remove(id);
+    if (ok) this._emit(EVENTS.CLIPS_CHANGE, { action: 'remove', id });
+    return ok;
+  }
+
+  clearClips() {
+    this._clipStore.clear();
+    this._emit(EVENTS.CLIPS_CHANGE, { action: 'clear' });
   }
 
   // 返回可 JSON 序列化的笔迹序列；未录制过返回 null
@@ -600,19 +681,53 @@ export class ScratchCard {
     return this._lastRecording || null;
   }
 
-  // 按录制时间戳节拍重放；recording 缺省时重放最近一次 stopRecording 的结果
+  // 按录制时间戳节拍重放；recording 缺省时重放最近一次 stopRecording 的结果。
+  // H1：recording 形参扩展——除既有 {version,events} 外，还接受单个 clip 对象、
+  // 单个 clip id，或 clip id 数组（顺序拼接，后一片段紧接前一片段节拍连续）。
   playRecording({ speed = 1, recording = this._lastRecording } = {}) {
     if (this._destroyed || !this._initialized || !this._player) return false;
     if (this._player.playing) return false;
-    if (!recording || !Array.isArray(recording.events) || recording.events.length === 0) {
-      return false;
-    }
+    const resolved = this._resolvePlayable(recording);
+    if (!resolved) return false;
     // 仅可从干净的 idle 封面起放（避免与既有刮痕/揭示态叠加）
     if (this.state !== STATES.IDLE || this._tracker.size() > 0) return false;
-    if (!this._player.play(recording, { speed })) return false;
+    if (!this._player.play(resolved, { speed })) return false;
     this._pointer.setEnabled(false); // 重放期间真实输入被忽略
-    this._emit(EVENTS.PLAY_START, { speed, events: recording.events.length });
+    this._emit(EVENTS.PLAY_START, { speed, events: resolved.events.length });
     return true;
+  }
+
+  _resolvePlayable(recording) {
+    if (Array.isArray(recording)) return this._composeClips(recording);
+    if (typeof recording === 'string') {
+      const clip = this._clipStore.get(recording);
+      if (!clip || clip.events.length === 0) return null;
+      this._clipStore.touch(clip.id);
+      return { version: RECORDING_VERSION, events: clip.events };
+    }
+    if (recording && Array.isArray(recording.events) && recording.events.length > 0) {
+      if (recording.id && this._clipStore.has(recording.id)) {
+        this._clipStore.touch(recording.id); // 库内片段被播放：刷新 LRU
+      }
+      return recording;
+    }
+    return null;
+  }
+
+  // clip id 数组 → 合成录制：事件时间轴按各片段 duration 顺移拼接（节拍连续）
+  _composeClips(ids) {
+    if (ids.length === 0) return null;
+    const events = [];
+    let offset = 0;
+    for (const id of ids) {
+      const clip = this._clipStore.get(id);
+      if (!clip) return null; // 任一 id 不存在则整体拒绝
+      for (const ev of clip.events) events.push({ ...ev, t: ev.t + offset });
+      offset += clip.duration;
+      this._clipStore.touch(id);
+    }
+    if (events.length === 0) return null;
+    return { version: RECORDING_VERSION, events };
   }
 
   _onPlayEnd() {
@@ -621,12 +736,135 @@ export class ScratchCard {
     this._emit(EVENTS.PLAY_END, {});
   }
 
+  // ---------- H2：状态序列化 ----------
+  // 导出 JSON 字符串：clips、undoLimit、进度口径、封面位图 dataURL 内嵌。
+  // 封面位图不可读（跨域 taint）时 cover 为 null，导入侧退回全新封面。
+  exportState() {
+    if (this._destroyed) return null;
+    let cover = null;
+    if (this._initialized && this._coverLayerRaw) {
+      try {
+        cover = {
+          dataURL: this._coverLayerRaw.getCanvas()._canvas.toDataURL('image/png'),
+          width: this.config.width,
+          height: this.config.height,
+          pixelRatio: this._pixelRatio,
+        };
+      } catch (err) {
+        cover = null;
+      }
+    }
+    return JSON.stringify({
+      version: STATE_VERSION,
+      undoLimit: this.config.undoLimit,
+      progress: {
+        ratio: this.getProgress(),
+        mode: this._useEstimator ? 'estimate' : 'sample',
+        targetRatio: this.config.targetRatio,
+      },
+      state: this.state,
+      clips: this._clipStore.list(),
+      cover,
+    });
+  }
+
+  // 恢复等价状态。版本策略：未知主版本拒绝（false），未知字段忽略。
+  // H4 接受矩阵：destroyed / 未初始化 / playing / recording / 刮涂中（活动指针）
+  // 一律拒绝（返回 false）；idle / revealing / revealed 接受。
+  // 导入后 undo/redo 栈清空（位图已整体替换，旧快照失效），录制/回放语义与直接操作一致。
+  importState(json) {
+    if (this._destroyed || !this._initialized) return false;
+    if (this._player && this._player.playing) return false;
+    if (this._recorder.recording) return false;
+    if (this.state === STATES.SCRATCHING || this._tracker.size() > 0) return false;
+    let data = json;
+    if (typeof json === 'string') {
+      try {
+        data = JSON.parse(json);
+      } catch (err) {
+        return false;
+      }
+    }
+    if (!data || typeof data !== 'object') return false;
+    if (Math.floor(Number(data.version)) !== STATE_VERSION) return false;
+
+    if (typeof data.undoLimit === 'number' && data.undoLimit >= 0) {
+      this.config.undoLimit = data.undoLimit;
+      if (this._history) {
+        this._history.limit = data.undoLimit;
+        this._history.enabled = data.undoLimit > 0;
+      }
+    }
+    if (Array.isArray(data.clips)) {
+      this._clipStore.replaceAll(data.clips);
+      this._emit(EVENTS.CLIPS_CHANGE, { action: 'import' });
+    }
+
+    // 取消进行中的 reveal，回到干净 idle（与 reset 同一条清理路径）
+    if (this._revealHandle) {
+      this._revealHandle.cancel();
+      this._revealHandle = null;
+    }
+    const canvasEl = this._coverLayerRaw.getCanvas()._canvas;
+    canvasEl.style.transition = '';
+    canvasEl.style.opacity = '1';
+    this._tracker.clear();
+    this._pendingSegments = [];
+    if (this._history) this._history.clear();
+    this._analyzer.reset();
+    this._estimator.reset();
+    this._useEstimator = false;
+    this._revealEmitted = false;
+    this.state = STATES.IDLE;
+    this._pointer.setEnabled(true);
+
+    const cover = data.cover;
+    if (cover && typeof cover.dataURL === 'string') {
+      const token = ++this._importToken;
+      const img = new Image();
+      img.onload = () => {
+        if (this._destroyed || token !== this._importToken) return;
+        if (this._cover.state === CoverState.NEEDS_PAINT) this._cover.init();
+        this._cover.paintImage(img, { width: this.config.width, height: this.config.height });
+        this._resyncAfterImport(data.progress);
+      };
+      img.onerror = () => {
+        if (this._destroyed || token !== this._importToken) return;
+        this._cover.reset(); // 位图损坏：退回全新封面
+        this._resyncAfterImport(null);
+      };
+      img.src = cover.dataURL;
+    } else {
+      this._importToken++;
+      this._cover.reset(); // 无内嵌位图：全新封面
+      this._resyncAfterImport(null);
+    }
+    this._emit(EVENTS.RESET, { reason: 'import' });
+    return true;
+  }
+
+  // 导入位图落地后按当前位图重采样；taint 时采用导出的进度口径并降级
+  _resyncAfterImport(progress) {
+    if (this._destroyed) return;
+    if (!this._analyzer.resync(defaultNow())) {
+      this._useEstimator = true;
+      const ratio = progress && typeof progress.ratio === 'number' ? progress.ratio : 0;
+      this._analyzer.ratio = ratio;
+      this._emit(EVENTS.PROGRESS_ERROR, {});
+      this._emit(EVENTS.PROGRESS, { ratio, sampledAt: defaultNow() });
+    }
+  }
+
   // 幂等销毁：移除全部原生监听、释放 capture、取消 rAF/定时器、解绑媒体查询
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
     this.state = STATES.DESTROYED;
     this._coverToken++; // 使进行中的图片加载回调失效
+    this._importToken++; // 使进行中的导入位图加载回调失效
+    // H1：destroy 时进行中的片段录制直接丢弃（不入库）；已入库片段保留在 localStorage
+    this._recorder.stop();
+    this._clipLabel = null;
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;

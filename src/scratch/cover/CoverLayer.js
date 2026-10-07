@@ -154,6 +154,28 @@ export class CoverLayer {
     crop.canvas = null;
   }
 
+  // H2：导入位图整体覆盖持久层（全幅 source-over 回贴，仍走 Konva 节点路径）
+  paintImage(image, { width, height } = {}) {
+    if (this.state !== CoverState.PERSISTENT || !this._createImage) return false;
+    const layer = this.layer;
+    const node = this._imagePool.pop() || this._createImage();
+    node.setAttrs({
+      image,
+      x: 0,
+      y: 0,
+      width: width || layer.width(),
+      height: height || layer.height(),
+      listening: false,
+      opacity: 1,
+      globalCompositeOperation: 'source-over',
+    });
+    layer.add(node);
+    layer.draw(); // 不清屏：在持久位图上整体覆盖
+    node.remove();
+    this._releaseImages([node]);
+    return true;
+  }
+
   // reveal 完成后清空位图（清屏一次再切回持久态，保持状态机一致）
   clearBitmap() {
     if (this.state !== CoverState.PERSISTENT) return;

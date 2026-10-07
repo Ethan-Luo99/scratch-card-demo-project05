@@ -30,11 +30,18 @@ export class Recorder {
     this._events = [];
     this._recording = true;
     this._startAt = this._now();
+    this._duration = 0;
   }
 
   stop() {
     if (!this._recording) return;
     this._recording = false;
+    this._duration = this._now() - this._startAt;
+  }
+
+  // H1：录制时长（毫秒）；录制中返回截至当前的实时时长
+  get duration() {
+    return this._recording ? this._now() - this._startAt : this._duration || 0;
   }
 
   pointerEvent(type, { pointerId, x, y }) {
